@@ -4,6 +4,7 @@ use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\AiSettingsController;
 use App\Http\Controllers\AiCommentLogController;
 use App\Http\Controllers\Admin\ChannelController;
+use App\Http\Controllers\Admin\PostController;
 
 
 
@@ -13,6 +14,12 @@ Route::prefix('admin')->group(function () {
     // ai deja /admin/ai/settings etc.
     Route::resource('channels', ChannelController::class)->names('admin.channels');
 });
+
+
+
+Route::resource('posts', PostController::class)->names('admin.posts');
+Route::post('posts/{post}/publish', [PostController::class,'publish'])->name('admin.posts.publish');
+
 
 
 Route::middleware(['web'])

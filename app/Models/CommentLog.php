@@ -7,7 +7,8 @@ use Illuminate\Database\Eloquent\Model;
 class CommentLog extends Model
 {
     protected $fillable = [
-        'page_id','post_id','comment_id','from_id',
+        'channel_id','post_id','post_channel_id',
+        'page_id','post_fb_id','comment_id','from_id',
         'message','reply','reply_id','status','meta'
     ];
 

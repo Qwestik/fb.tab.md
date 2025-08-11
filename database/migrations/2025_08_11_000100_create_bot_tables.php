@@ -1,50 +1,82 @@
 <?php
+
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration {
-  public function up(): void {
-    Schema::create('social_accounts', function (Blueprint $t) {
-      $t->id(); $t->string('provider')->default('facebook_page');
-      $t->string('page_id')->index(); $t->string('name')->nullable();
-      $t->text('access_token'); $t->json('config')->nullable(); $t->timestamps();
-    });
-    Schema::create('posts', function (Blueprint $t) {
-      $t->id(); $t->uuid()->unique(); $t->string('status')->default('scheduled');
-      $t->timestamp('scheduled_at')->nullable(); $t->timestamp('published_at')->nullable();
-      $t->string('timezone')->default(config('app.timezone','Europe/Chisinau')); $t->timestamps();
-    });
-    Schema::create('post_targets', function (Blueprint $t) {
-      $t->id(); $t->foreignId('post_id')->constrained('posts')->cascadeOnDelete();
-      $t->foreignId('account_id')->constrained('social_accounts')->cascadeOnDelete();
-      $t->string('status')->default('scheduled'); $t->string('provider_post_id')->nullable();
-      $t->json('errors')->nullable(); $t->timestamps(); $t->unique(['post_id','account_id']);
-    });
-    Schema::create('post_versions', function (Blueprint $t) {
-      $t->id(); $t->foreignId('post_id')->constrained('posts')->cascadeOnDelete();
-      $t->foreignId('account_id')->constrained('social_accounts')->cascadeOnDelete();
-      $t->longText('body'); $t->json('media')->nullable(); $t->timestamps();
-      $t->unique(['post_id','account_id']);
-    });
-    Schema::create('media', function (Blueprint $t) {
-      $t->id(); $t->uuid()->unique(); $t->string('disk')->default('public');
-      $t->string('path'); $t->string('mime')->nullable(); $t->unsignedBigInteger('size')->default(0);
-      $t->json('conversions')->nullable(); $t->timestamps();
-    });
-    Schema::create('ai_settings', function (Blueprint $t) { $t->id(); $t->json('config'); $t->timestamps(); });
-    Schema::create('comment_logs', function (Blueprint $t) {
-      $t->id(); $t->string('page_id')->index(); $t->string('post_id')->index();
-      $t->string('comment_id')->unique(); $t->string('from_id')->nullable();
-      $t->text('message')->nullable(); $t->text('reply')->nullable();
-      $t->string('reply_id')->nullable(); $t->string('status')->default('fetched');
-      $t->json('meta')->nullable(); $t->timestamps();
-    });
-  }
-  public function down(): void {
-    Schema::dropIfExists('comment_logs'); Schema::dropIfExists('ai_settings');
-    Schema::dropIfExists('media'); Schema::dropIfExists('post_versions');
-    Schema::dropIfExists('post_targets'); Schema::dropIfExists('posts');
-    Schema::dropIfExists('social_accounts');
-  }
+    public function up(): void
+    {
+        // 🔧 Completează posts dacă lipsesc coloane (NU recrea tabela)
+        if (Schema::hasTable('posts')) {
+            Schema::table('posts', function (Blueprint $table) {
+                // uuid
+                if (!Schema::hasColumn('posts', 'uuid')) {
+                    $table->uuid('uuid')->nullable()->unique()->after('id');
+                }
+                // timezone
+                if (!Schema::hasColumn('posts', 'timezone')) {
+                    $table->string('timezone')->default('UTC')->after('published_at');
+                }
+                // status – dacă nu există deloc (în cazul tău există deja, enum)
+                if (!Schema::hasColumn('posts', 'status')) {
+                    $table->enum('status', ['draft','scheduled','published'])->default('scheduled')->after('body');
+                }
+            });
+        } else {
+            // fallback rar: dacă nu există deloc posts, creeaz-o minimal
+            Schema::create('posts', function (Blueprint $table) {
+                $table->id();
+                $table->uuid('uuid')->nullable()->unique();
+                $table->string('title')->nullable();
+                $table->longText('body')->nullable();
+                $table->enum('status', ['draft','scheduled','published'])->default('scheduled');
+                $table->timestamp('scheduled_at')->nullable();
+                $table->timestamp('published_at')->nullable();
+                $table->string('timezone')->default('UTC');
+                $table->timestamps();
+            });
+        }
+
+        // 📒 Jurnal comentarii AI (dacă nu există)
+        if (!Schema::hasTable('comment_logs')) {
+            Schema::create('comment_logs', function (Blueprint $table) {
+                $table->id();
+                $table->string('platform')->default('facebook'); // facebook|instagram
+                $table->string('page_id')->index();
+                $table->string('post_id')->index();      // provider post id (ex: 523..._123...)
+                $table->string('comment_id')->index();   // provider comment id
+                $table->string('from_id')->nullable();
+                $table->text('message')->nullable();
+                $table->text('reply')->nullable();
+                $table->string('reply_id')->nullable();
+                $table->string('status')->default('logged'); // logged|replied|skipped|failed
+                $table->json('meta')->nullable();
+                $table->timestamps();
+            });
+        }
+
+        // (opțional) alte tabele auxiliare specifice botului pot fi create aici, dar NU recrea 'posts'
+    }
+
+    public function down(): void
+    {
+        // Revers pentru ce-am adăugat aici (fără să ștergem posts)
+        if (Schema::hasTable('comment_logs')) {
+            Schema::dropIfExists('comment_logs');
+        }
+
+        // Scoate coloanele adăugate din posts (dacă există)
+        if (Schema::hasTable('posts')) {
+            Schema::table('posts', function (Blueprint $table) {
+                if (Schema::hasColumn('posts', 'uuid')) {
+                    $table->dropUnique(['uuid']);
+                    $table->dropColumn('uuid');
+                }
+                if (Schema::hasColumn('posts', 'timezone')) {
+                    $table->dropColumn('timezone');
+                }
+            });
+        }
+    }
 };

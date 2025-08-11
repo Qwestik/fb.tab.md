@@ -1,126 +1,206 @@
 <?php
+
 namespace App\Console\Commands;
 
+use App\Models\Channel;
+use App\Models\CommentLog;
+use App\Models\PostChannel;
+use Carbon\Carbon;
 use Illuminate\Console\Command;
-use Illuminate\Support\Facades\DB;
-use App\Models\AiSetting;
-use App\Services\FacebookClient;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Http;
 
 class BotAutoReply extends Command
 {
-    protected $signature = 'bot:auto-reply {--since-minutes=60} {--ingest-only} {--dry} {--debug} {--source=page} {--post=}';
-    protected $description = 'Citește comentarii și (opțional) răspunde automat';
+    protected $signature = 'bot:auto-reply 
+        {--since=7d : Interval pentru postări publicate (ex: 2h, 3d)}
+        {--limit=100 : Câte comentarii să ia pe post}
+        {--dry : Nu postează, doar afișează}
+        {--debug : Mesaje verbose}';
+
+    protected $description = 'Citește comentarii la postările publicate și răspunde automat doar când ultimul mesaj din thread e al utilizatorului.';
 
     public function handle(): int
     {
-        $debug  = (bool)$this->option('debug');
-        $source = strtolower($this->option('source'));
-        $onlyPost = $this->option('post');
-        $minutes = (int)$this->option('since-minutes');
-        $since = now()->subMinutes($minutes);
+        $since = $this->parseSince($this->option('since'));
+        $limit = (int)$this->option('limit');
+        $dry   = (bool)$this->option('dry');
+        $debug = (bool)$this->option('debug');
 
-        $cfg = AiSetting::first()?->config ?? [];
-        $pageToken = $cfg['page_token'] ?? null;
-        $openaiKey = $cfg['openai_key'] ?? env('OPENAI_API_KEY');
+        $channels = Channel::where('platform', 'fb')->get();
+        if ($channels->isEmpty()) {
+            $this->warn('Nu există canale Facebook.');
+            return 0;
+        }
 
-        if (!$pageToken) { $this->error('Lipsă Facebook Page Access Token.'); return 1; }
-        if (!$openaiKey) { $this->warn('Lipsă OPENAI_API_KEY – voi răspunde cu fallback.'); }
-
-        $fb = new FacebookClient($pageToken);
-        $ai = $openaiKey ? \OpenAI::client($openaiKey) : null;
-        $textModel = $cfg['text_model'] ?? 'gpt-4o-mini';
-
-        // ce postări citim
-        $postIds = [];
-        if ($onlyPost) {
-            $postIds = [$onlyPost];
-        } else {
-            if ($source === 'page' || $source === 'all') {
-                $pageId = $fb->getPageId();
-                if ($pageId) {
-                    $posts = $fb->listPosts($pageId, ['since' => $since->timestamp, 'limit' => 25]);
-                    foreach ($posts as $p) if (!empty($p['id'])) $postIds[] = $p['id'];
-                }
+        foreach ($channels as $ch) {
+            if (!$ch->page_id || !$ch->access_token) {
+                $this->warn("Canal #{$ch->id} lipsesc page_id / access_token.");
+                continue;
             }
-            if ($source === 'mixpost' || $source === 'all') {
-                $mix = DB::table('post_targets as t')
-                    ->join('posts as p','p.id','=','t.post_id')
-                    ->select('t.provider_post_id')
-                    ->whereNotNull('t.provider_post_id')
-                    ->where(function($q) use($since){
-                        $q->where('p.published_at','>=',$since)->orWhere('p.created_at','>=',$since);
-                    })
-                    ->orderByDesc('p.published_at')
-                    ->limit(25)->pluck('provider_post_id')->all();
-                $postIds = array_merge($postIds, $mix);
+
+            // Postări publicate pentru canalul curent
+            $posts = PostChannel::query()
+                ->where('channel_id', $ch->id)
+                ->where('status', 'published')
+                ->where(function ($q) {
+                    $q->whereNotNull('provider_post_id')
+                      ->orWhereNotNull('fb_post_id');
+                })
+                // dacă nu ai 'published_at' setat pe PostChannel, folosim updated_at ca fallback
+                ->where(function ($q) use ($since) {
+                    $q->where('published_at', '>=', $since)
+                      ->orWhere('updated_at', '>=', $since);
+                })
+                ->orderByDesc('published_at')
+                ->orderByDesc('updated_at')
+                ->get();
+
+            $this->info("Canal {$ch->name} (#{$ch->id}) — postări: ".$posts->count());
+
+            foreach ($posts as $pc) {
+                $postId = $pc->provider_post_id ?: $pc->fb_post_id;
+                if (!$postId) { if ($debug) $this->line('  • Post fără provider_post_id/fb_post_id'); continue; }
+
+                $this->line("  • Post {$postId}");
+
+                // 1) comentarii top-level
+                $top = Http::timeout(20)->get(
+                    "https://graph.facebook.com/v23.0/{$postId}/comments",
+                    [
+                        'access_token' => $ch->access_token,
+                        'order'        => 'chronological',
+                        'filter'       => 'toplevel',
+                        'limit'        => $limit,
+                        'fields'       => 'id,from{id,name},message,created_time',
+                    ]
+                );
+                if (!$top->successful()) {
+                    $this->warn('    ! Eroare FB (toplevel): '.$top->status().' '.$top->body());
+                    continue;
+                }
+
+                $topComments = collect($top->json('data', []));
+                if ($topComments->isEmpty()) { if ($debug) $this->line('    (fără top-level)'); continue; }
+
+                // 2) pentru fiecare thread: răspunde DOAR dacă ultimul mesaj e al utilizatorului
+                foreach ($topComments as $root) {
+                    $thread = $this->fetchThread($root, $ch->access_token); // [root, reply1, reply2,...] cronologic
+                    if ($thread->isEmpty()) continue;
+
+                    $last     = $thread->last();
+                    $lastId   = data_get($last, 'id');
+                    $lastFrom = data_get($last, 'from.id');
+                    $lastMsg  = trim((string) data_get($last, 'message', ''));
+
+                    // dacă ultimul din thread este pagina -> noi am vorbit ultimii, nu mai răspundem acum
+                    if ($lastFrom === $ch->page_id) { if ($debug) $this->line('    - skip (last=page)'); continue; }
+                    if ($lastMsg === '')            { if ($debug) $this->line('    - skip empty'); continue; }
+
+                    // evită dublurile: dacă am răspuns deja FIX la acest comentariu
+                    if (CommentLog::where('comment_id', $lastId)->exists()) {
+                        if ($debug) $this->line("    - skip (logged) {$lastId}");
+                        continue;
+                    }
+
+                    $reply = $this->generateReply($lastMsg);
+                    if ($debug) $this->line("    -> reply: ".mb_substr($reply, 0, 120).'…');
+
+                    $replyId = null; $status = 'sent'; $error = null;
+
+                    if (!$dry) {
+                        $r = Http::asForm()->timeout(20)->post(
+                            "https://graph.facebook.com/v23.0/{$lastId}/comments",
+                            ['access_token' => $ch->access_token, 'message' => $reply]
+                        );
+                        if ($r->successful()) {
+                            $replyId = data_get($r->json(), 'id');
+                            if ($debug) $this->line("    + FB ok: reply_id={$replyId}");
+                        } else {
+                            $status = 'error';
+                            $error  = $r->status().' '.$r->body();
+                            $this->warn('    ! FB error: '.$error);
+                        }
+                    }
+
+                    CommentLog::create([
+                        'channel_id'     => $ch->id,
+                        'post_id'        => $pc->post_id,
+                        'post_channel_id'=> $pc->id,
+                        'page_id'        => $ch->page_id,
+                        'post_fb_id'     => $postId,
+                        'comment_id'     => $lastId,
+                        'from_id'        => $lastFrom,
+                        'message'        => $lastMsg,
+                        'reply'          => $reply,
+                        'reply_id'       => $replyId,
+                        'status'         => $status,
+                        'meta'           => $error ? ['fb_error' => $error] : null,
+                    ]);
+                }
             }
         }
-        $postIds = array_values(array_unique(array_filter($postIds)));
-        $this->info('Postări de verificat: '.count($postIds));
 
-        foreach ($postIds as $pid) {
-            $comments = $fb->getComments($pid, ['since'=>$since->timestamp]);
-            if ($debug) $this->line(" - {$pid} | comments=".count($comments));
-
-            foreach ($comments as $c) {
-                $cid = $c['id'] ?? null;
-                $msg = trim($c['message'] ?? '');
-                if (!$cid || $msg==='') continue;
-
-                // deja logat?
-                if (DB::table('comment_logs')->where('comment_id',$cid)->exists()) {
-                    if ($debug) $this->line("   · skip seen: {$cid}");
-                    continue;
-                }
-
-                if ($this->option('ingest-only')) {
-                    DB::table('comment_logs')->insert([
-                        'page_id' => explode('_',$pid)[0] ?? '',
-                        'post_id' => $pid,
-                        'comment_id' => $cid,
-                        'from_id' => $c['from']['id'] ?? null,
-                        'message' => $msg,
-                        'status' => 'fetched',
-                        'created_at'=>now(),'updated_at'=>now(),
-                    ]);
-                    continue;
-                }
-
-                // răspuns
-                $reply = 'Mulțumim pentru mesaj! Revenim curând cu detalii.';
-                if ($ai) {
-                    try {
-                        $res = $ai->chat()->create([
-                            'model' => $textModel,
-                            'messages' => [
-                                ['role'=>'system','content'=>'Răspunde scurt, prietenos, politicos pentru un brand tech.'],
-                                ['role'=>'user','content'=>"Comentariu: {$msg}\nScrie un răspuns (1-2 fraze)."],
-                            ],
-                            'temperature' => 0.6,
-                        ]);
-                        $reply = trim($res->choices[0]->message->content ?? $reply);
-                    } catch (\Throwable $e) { report($e); }
-                }
-
-                if ($this->option('dry')) {
-                    DB::table('comment_logs')->insert([
-                        'page_id'=>explode('_',$pid)[0] ?? '',
-                        'post_id'=>$pid,'comment_id'=>$cid,'from_id'=>$c['from']['id']??null,
-                        'message'=>$msg,'reply'=>$reply,'status'=>'dry',
-                        'created_at'=>now(),'updated_at'=>now(),
-                    ]);
-                    continue;
-                }
-
-                $rid = $fb->replyToComment($cid, $reply);
-                DB::table('comment_logs')->insert([
-                    'page_id'=>explode('_',$pid)[0] ?? '',
-                    'post_id'=>$pid,'comment_id'=>$cid,'from_id'=>$c['from']['id']??null,
-                    'message'=>$msg,'reply'=>$reply,'reply_id'=>$rid,'status'=>$rid?'replied':'error',
-                    'created_at'=>now(),'updated_at'=>now(),
-                ]);
-            }
-        }
         return 0;
+    }
+
+    /**
+     * Ia întreg thread-ul: comentariul rădăcină + răspunsuri (cronologic).
+     */
+    protected function fetchThread(array $root, string $token): Collection
+    {
+        $rootId = data_get($root, 'id');
+        $items  = collect([$root]);
+
+        $r = Http::timeout(20)->get(
+            "https://graph.facebook.com/v23.0/{$rootId}/comments",
+            [
+                'access_token' => $token,
+                'order'        => 'chronological',
+                'limit'        => 100,
+                'fields'       => 'id,from{id,name},message,created_time',
+            ]
+        );
+
+        if ($r->successful()) {
+            $items = $items->merge($r->json('data', []));
+        }
+
+        return $items->sortBy(fn ($c) => strtotime((string) data_get($c, 'created_time')))->values();
+    }
+
+    protected function parseSince(string $s): Carbon
+    {
+        $s = trim($s);
+        if (preg_match('/^(\d+)\s*h$/', $s, $m)) return now()->subHours((int) $m[1]);
+        if (preg_match('/^(\d+)\s*d$/', $s, $m)) return now()->subDays((int) $m[1]);
+        return now()->subDays(7);
+    }
+
+    protected function generateReply(string $msg): string
+    {
+        $apiKey = config('services.openai.key') ?? env('OPENAI_API_KEY');
+        $model  = env('AI_MODEL_TEXT', 'gpt-4o-mini');
+
+        $fallback = "Mulțumim pentru comentariu! Dacă ai întrebări sau dorești detalii suplimentare, scrie-ne în privat.";
+
+        if (!$apiKey) return $fallback;
+
+        try {
+            $client = \OpenAI::client($apiKey);
+            $res = $client->chat()->create([
+                'model' => $model,
+                'messages' => [
+                    ['role'=>'system','content'=>'Răspunzi scurt, prietenos și util pentru o pagină Xiaomi Moldova (tab.md). Fără promisiuni false, fără emoji excesive. Ton profesionist, cald.'],
+                    ['role'=>'user','content'=>"Scrie un răspuns de 1–2 fraze la acest comentariu de pe Facebook:\n\"{$msg}\"\nDacă e întrebare, răspunde direct și invită politicos la mesaj privat pentru detalii/preț."],
+                ],
+                'temperature' => 0.6,
+                'max_tokens'  => 120,
+            ]);
+            return trim($res->choices[0]->message->content ?? $fallback);
+        } catch (\Throwable $e) {
+            report($e);
+            return $fallback;
+        }
     }
 }

@@ -11,6 +11,7 @@
     <a class="navbar-brand" href="/">AI Bot</a>
     <a class="nav-link" href="/admin/ai/settings">Setări</a>
     <a class="nav-link" href="/admin/ai/comments">Comentarii</a>
+	<a class="nav-link" href="{{ route('admin.channels.index') }}">Channels</a>
   </div>
 </nav>
 <div class="container">@yield('content')</div>
