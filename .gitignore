@@ -1,0 +1,50 @@
+# OS / editoare
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+
+# Loguri
+*.log
+storage/logs/*
+!storage/logs/.gitignore
+
+# Cache Laravel
+bootstrap/cache/*.php
+!bootstrap/cache/.gitignore
+
+# Env & credențiale (nu uita să COMIȚI .env.example)
+.env
+.env.*
+!.env.example
+auth.json
+
+# Composer / Node
+/vendor
+/node_modules
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Artefacte de build / storage public
+/public/hot
+/public/build
+/public/storage
+/storage/*.key
+/storage/pail
+
+# IDE / tool config
+/.idea
+/.vscode
+/.fleet
+/.nova
+/.phpunit.cache
+/.zed
+.phpactor.json
+
+# Teste
+.phpunit.result.cache
+
+# Diverse
+*.patch
